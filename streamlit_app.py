@@ -5,6 +5,8 @@ Streamlit Web App (self-contained, no external deps beyond streamlit)
 
 import random
 import re
+import json
+import base64
 from datetime import datetime
 import streamlit as st
 
@@ -733,6 +735,37 @@ COMP_TEMPLATES = {
 }
 
 # ────────────────────────────────────────────────────────────────────────────────
+# JSON DATA OVERRIDE — loads testament_data.json if present (admin edits persist here)
+# ────────────────────────────────────────────────────────────────────────────────
+
+try:
+    with open("testament_data.json", "r", encoding="utf-8") as _f:
+        _jd = json.load(_f)
+    if _jd.get("game_concepts"):
+        GAME_CONCEPTS.update(_jd["game_concepts"])
+    if _jd.get("abilities"):
+        ABILITIES[:] = _jd["abilities"]
+    if _jd.get("faction_guide"):
+        for _k, _v in _jd["faction_guide"].items():
+            if _k in FACTION_GUIDE:
+                FACTION_GUIDE[_k].update({
+                    "lore":       _v.get("lore",       FACTION_GUIDE[_k]["lore"]),
+                    "figures":    [tuple(f) for f in _v.get("figures",    [])],
+                    "playstyle":  _v.get("playstyle",  FACTION_GUIDE[_k]["playstyle"]),
+                    "strengths":  _v.get("strengths",  FACTION_GUIDE[_k]["strengths"]),
+                    "weaknesses": _v.get("weaknesses", FACTION_GUIDE[_k]["weaknesses"]),
+                    "counter":    _v.get("counter",    FACTION_GUIDE[_k]["counter"]),
+                })
+    if _jd.get("faction_quotes"):
+        for _fn, _qs in _jd["faction_quotes"].items():
+            if _fn in FACTIONS:
+                FACTIONS[_fn]["flavor_quotes"] = _qs
+except FileNotFoundError:
+    pass
+except Exception:
+    pass  # silently fall back to hardcoded defaults
+
+# ────────────────────────────────────────────────────────────────────────────────
 # GENERATION LOGIC
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -1360,6 +1393,208 @@ def page_art_director():
 
 
 # ────────────────────────────────────────────────────────────────────────────────
+# ADMIN — GitHub save helper
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _load_current_json() -> dict:
+    """Load current testament_data.json if it exists, else empty dict."""
+    try:
+        with open("testament_data.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _github_save(data: dict):
+    """Commit testament_data.json to GitHub repo. Returns (success, message)."""
+    try:
+        import requests
+    except ImportError:
+        return False, "requests package not installed. Add `requests>=2.28.0` to requirements.txt."
+    try:
+        token = st.secrets["GITHUB_TOKEN"]
+        repo  = st.secrets["GITHUB_REPO"]
+    except Exception:
+        return False, "Add GITHUB_TOKEN and GITHUB_REPO to Streamlit secrets (app settings → Secrets)."
+
+    url     = f"https://api.github.com/repos/{repo}/contents/testament_data.json"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+    # Get current file SHA (required for updates)
+    r = requests.get(url, headers=headers, timeout=10)
+    sha = r.json().get("sha", "") if r.status_code == 200 else ""
+
+    content = base64.b64encode(
+        json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+
+    payload = {"message": "Admin update via Testament web app", "content": content}
+    if sha:
+        payload["sha"] = sha
+
+    r2 = requests.put(url, headers=headers, json=payload, timeout=20)
+    if r2.status_code in (200, 201):
+        return True, "Saved to GitHub. App will redeploy in ~60 seconds with your changes."
+    else:
+        return False, f"GitHub API error {r2.status_code}: {r2.text[:300]}"
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# ADMIN — section editors
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _admin_game_concepts():
+    st.subheader("📖 Game Concepts")
+    st.caption("Edit the text for each game concept section. Markdown supported.")
+    edits = {}
+    for section, text in GAME_CONCEPTS.items():
+        edits[section] = st.text_area(section, value=text, height=220, key=f"adm_gc_{section}")
+
+    with st.expander("➕ Add new section"):
+        new_name = st.text_input("Section name", key="adm_gc_newname")
+        new_text = st.text_area("Content", height=120, key="adm_gc_newtext")
+        if st.button("Add section") and new_name.strip():
+            edits[new_name.strip()] = new_text
+
+    st.divider()
+    if st.button("💾 Save Game Concepts to GitHub", type="primary", key="save_gc"):
+        d = _load_current_json()
+        d["game_concepts"] = edits
+        ok, msg = _github_save(d)
+        st.success(msg) if ok else st.error(msg)
+
+
+def _admin_abilities():
+    st.subheader("⚡ Ability Library")
+    st.caption("Edit, add, or remove abilities. Category values: Keyword | Triggered | Activated | Static")
+    try:
+        import pandas as pd
+    except ImportError:
+        st.error("pandas is required for the ability editor. Add `pandas>=1.5.0` to requirements.txt.")
+        return
+
+    df = pd.DataFrame(ABILITIES)
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "name":    st.column_config.TextColumn("Name", width="medium"),
+            "cat":     st.column_config.SelectboxColumn("Category", options=["Keyword", "Triggered", "Activated", "Static"]),
+            "rules":   st.column_config.TextColumn("Rules Text", width="large"),
+            "faction": st.column_config.TextColumn("Faction", width="medium"),
+            "power":   st.column_config.NumberColumn("Power", min_value=1, max_value=5, step=1),
+        },
+        key="adm_ab_editor",
+    )
+    st.divider()
+    if st.button("💾 Save Abilities to GitHub", type="primary", key="save_ab"):
+        d = _load_current_json()
+        d["abilities"] = [row for row in edited.to_dict(orient="records") if row.get("name")]
+        ok, msg = _github_save(d)
+        st.success(msg) if ok else st.error(msg)
+
+
+def _admin_faction_guide():
+    st.subheader("🌍 Faction Guide")
+    st.caption("Edit lore, playstyle, figures, strengths, weaknesses, and counter-strategy per faction.")
+    sel = st.selectbox("Select faction", list(FACTION_GUIDE.keys()), key="adm_fg_sel")
+    fg  = FACTION_GUIDE[sel]
+
+    lore      = st.text_area("Lore", value=fg["lore"], height=150, key=f"adm_fg_lore_{sel}")
+    playstyle = st.text_area("Playstyle", value=fg["playstyle"], height=110, key=f"adm_fg_ps_{sel}")
+
+    st.markdown("**Key Figures** — one per line, format: `Name | Description`")
+    fig_text = "\n".join(f"{n} | {d}" for n, d in fg["figures"])
+    fig_edit = st.text_area("Figures", value=fig_text, height=150, key=f"adm_fg_fig_{sel}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Strengths** — one per line")
+        str_edit = st.text_area("Strengths", value="\n".join(fg["strengths"]), height=130, key=f"adm_fg_str_{sel}")
+    with c2:
+        st.markdown("**Weaknesses** — one per line")
+        wk_edit  = st.text_area("Weaknesses", value="\n".join(fg["weaknesses"]), height=130, key=f"adm_fg_wk_{sel}")
+
+    counter = st.text_area("How to Beat This Faction", value=fg["counter"], height=110, key=f"adm_fg_ctr_{sel}")
+
+    st.divider()
+    if st.button(f"💾 Save {sel} guide to GitHub", type="primary", key=f"save_fg_{sel}"):
+        figures = []
+        for line in fig_edit.strip().split("\n"):
+            if "|" in line:
+                parts = line.split("|", 1)
+                figures.append([parts[0].strip(), parts[1].strip()])
+        d = _load_current_json()
+        d.setdefault("faction_guide", {})[sel] = {
+            "lore":       lore,
+            "figures":    figures,
+            "playstyle":  playstyle,
+            "strengths":  [s for s in str_edit.strip().split("\n") if s.strip()],
+            "weaknesses": [w for w in wk_edit.strip().split("\n") if w.strip()],
+            "counter":    counter,
+        }
+        ok, msg = _github_save(d)
+        st.success(msg) if ok else st.error(msg)
+
+
+def _admin_faction_quotes():
+    st.subheader("💬 Faction Flavor Quotes")
+    st.caption("Edit the flavor quote pool for each faction. One quote per line.")
+    sel    = st.selectbox("Select faction", list(FACTIONS.keys()), key="adm_fq_sel")
+    quotes = FACTIONS[sel]["flavor_quotes"]
+    edit   = st.text_area("Quotes", value="\n".join(quotes), height=250, key=f"adm_fq_{sel}")
+
+    st.divider()
+    if st.button(f"💾 Save {sel} quotes to GitHub", type="primary", key=f"save_fq_{sel}"):
+        new_qs = [q.strip() for q in edit.strip().split("\n") if q.strip()]
+        d = _load_current_json()
+        d.setdefault("faction_quotes", {})[sel] = new_qs
+        ok, msg = _github_save(d)
+        st.success(msg) if ok else st.error(msg)
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# ADMIN PAGE
+# ────────────────────────────────────────────────────────────────────────────────
+
+def page_admin():
+    st.header("🔧 Admin Panel")
+
+    # ── Password gate ─────────────────────────────────────────────────────────
+    if not st.session_state.get("admin_auth"):
+        st.caption("This area is for game designers only.")
+        pwd = st.text_input("Admin Password", type="password", key="adm_pwd")
+        if st.button("Login", type="primary"):
+            try:
+                expected = st.secrets.get("ADMIN_PASSWORD", "testament2024")
+            except Exception:
+                expected = "testament2024"
+            if pwd == expected:
+                st.session_state["admin_auth"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        st.caption("Default password (local testing): `testament2024`  "
+                   "— set `ADMIN_PASSWORD` in Streamlit secrets for production.")
+        return
+
+    if st.button("🔓 Logout"):
+        st.session_state["admin_auth"] = False
+        st.rerun()
+
+    st.info("Changes are committed to your GitHub repo. The app redeploys in ~60 seconds.")
+
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["📖 Game Concepts", "⚡ Abilities", "🌍 Faction Guide", "💬 Faction Quotes"]
+    )
+    with tab1: _admin_game_concepts()
+    with tab2: _admin_abilities()
+    with tab3: _admin_faction_guide()
+    with tab4: _admin_faction_quotes()
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -1372,7 +1607,7 @@ def main():
         st.divider()
         page = st.radio(
             "Navigate",
-            ["🃏 Card Generator", "📖 Game Concepts", "⚡ Ability Library", "🌍 Faction Guide", "🎨 Art Director"],
+            ["🃏 Card Generator", "📖 Game Concepts", "⚡ Ability Library", "🌍 Faction Guide", "🎨 Art Director", "🔧 Admin"],
             label_visibility="collapsed",
         )
         st.divider()
@@ -1387,6 +1622,7 @@ def main():
     elif page == "⚡ Ability Library":  page_ability_library()
     elif page == "🌍 Faction Guide":    page_faction_guide()
     elif page == "🎨 Art Director":     page_art_director()
+    elif page == "🔧 Admin":            page_admin()
 
 
 if __name__ == "__main__":
