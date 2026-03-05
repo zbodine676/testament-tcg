@@ -1000,78 +1000,261 @@ def css():
     """, unsafe_allow_html=True)
 
 
+# ────────────────────────────────────────────────────────────────────────────────
+# GENERATOR HELPERS — session state & per-field regeneration
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _load_card_to_state(card: dict):
+    """Write a freshly generated card into all edit_* session-state keys."""
+    abilities = card.get("abilities", [])
+    st.session_state.update({
+        "ws_faction":    card["faction"],
+        "ws_card_type":  card["card_type"],
+        "edit_name":     card["name"],
+        "edit_cost":     card["cost"],
+        "edit_rarity":   card["rarity"],
+        "edit_type_line": card["type_line"],
+        "edit_ab0":      abilities[0] if len(abilities) > 0 else "",
+        "edit_ab1":      abilities[1] if len(abilities) > 1 else "",
+        "edit_ab2":      abilities[2] if len(abilities) > 2 else "",
+        "edit_flavor":   card["flavor"],
+        "edit_atk":      int(card["atk"]) if card["atk"] is not None else 0,
+        "edit_def":      int(card["def"]) if card["def"] is not None else 0,
+        "edit_art_desc": card["art_desc"],
+        "card_generated": True,
+    })
+
+
+def _card_from_state() -> dict:
+    """Build a card dict from the current edit_* session-state values."""
+    faction   = st.session_state.get("ws_faction",   "Celestial Host")
+    card_type = st.session_state.get("ws_card_type", "Servant")
+    rarity    = st.session_state.get("edit_rarity",  "Common")
+    abilities = [a for a in [
+        st.session_state.get("edit_ab0", ""),
+        st.session_state.get("edit_ab1", ""),
+        st.session_state.get("edit_ab2", ""),
+    ] if a.strip()]
+    is_servant = (card_type == "Servant")
+    return {
+        "name":      st.session_state.get("edit_name", ""),
+        "cost":      st.session_state.get("edit_cost", ""),
+        "rarity":    rarity,
+        "badge":     RARITIES[rarity]["badge"],
+        "type_line": st.session_state.get("edit_type_line", ""),
+        "card_type": card_type,
+        "atk":       int(st.session_state.get("edit_atk", 0)) if is_servant else None,
+        "def":       int(st.session_state.get("edit_def", 0)) if is_servant else None,
+        "stars":     RARITIES[rarity]["star"],
+        "abilities": abilities if abilities else ["—"],
+        "flavor":    st.session_state.get("edit_flavor", ""),
+        "art_desc":  st.session_state.get("edit_art_desc", ""),
+        "faction":   faction,
+        "symbol":    FACTIONS[faction]["symbol"],
+    }
+
+
+def _regen_effect(faction_name: str, card_type: str, card_name: str) -> str:
+    """Pick a random triggered/activated/spell effect for the given type."""
+    fd = FACTIONS[faction_name]
+    pools = {
+        "Servant":    fd["triggered_effects"] + fd["activated_effects"],
+        "Prayer":     fd["prayer_effects"],
+        "Miracle":    fd["miracle_effects"],
+        "Covenant":   fd["covenant_effects"],
+        "Relic":      fd["relic_effects"],
+        "Shrine":     fd["shrine_effects"],
+        "Divine Trap": fd["trap_effects"],
+    }
+    pool = pools.get(card_type, fd["triggered_effects"])
+    return random.choice(pool).replace("{NAME}", card_name)
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# GENERATOR PAGE — forge + workshop
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _regen_btn(label: str, key: str, help_text: str = "") -> bool:
+    """Compact 🔄 button that sits beside a field."""
+    st.markdown("<div style='margin-top:22px'></div>", unsafe_allow_html=True)
+    return st.button(label, key=key, help=help_text, use_container_width=True)
+
+
 def page_generator():
     st.header("🃏 Card Generator")
-    st.caption("Select a faction, card type, and concept — the engine handles the rest.")
 
-    col_ctrl, col_card = st.columns([1, 2], gap="large")
+    # ── Top bar: faction / type / concept / name ──────────────────────────────
+    c1, c2, c3, c4 = st.columns([2, 2, 3, 2])
+    with c1:
+        faction_sel = st.selectbox("Faction", list(FACTIONS.keys()) + ["★ Surprise Me"], key="sel_faction")
+    with c2:
+        type_sel = st.selectbox("Card Type", CARD_TYPES + ["★ Surprise Me"], key="sel_type")
+    with c3:
+        concept = st.text_input("Concept / Idea", placeholder="e.g. angel who guards heaven", key="sel_concept")
+    with c4:
+        name_override = st.text_input("Card Name (optional)", placeholder="Leave blank to auto-generate", key="sel_name_override")
 
-    with col_ctrl:
-        faction_list = list(FACTIONS.keys())
-        faction_opts = faction_list + ["★ Surprise Me"]
-        faction_sel = st.selectbox("Faction", faction_opts, key="gen_faction")
+    sc1, sc2, sc3 = st.columns([2, 2, 1])
+    with sc1:
+        use_seed = st.checkbox("Lock seed (reproducible)", value=False, key="use_seed")
+    with sc2:
+        if st.session_state.get("use_seed"):
+            st.number_input("Seed", 0, 99999, 42, key="seed_val")
+    with sc3:
+        generate = st.button("⚡ FORGE CARD", type="primary", use_container_width=True)
 
-        type_opts = CARD_TYPES + ["★ Surprise Me"]
-        type_sel = st.selectbox("Card Type", type_opts, key="gen_type")
-
-        concept = st.text_input(
-            "Concept / Idea (optional)",
-            placeholder="e.g. an angel who guards the gates of heaven",
-            key="gen_concept",
-        )
-
-        seed_lock = st.checkbox("Lock seed (reproducible)", value=False)
-        if seed_lock:
-            seed_val = st.number_input("Seed", min_value=0, max_value=99999, value=42)
-
-        generate = st.button("⚡ FORGE CARD", use_container_width=True, type="primary")
-
+    # ── Handle initial generation ─────────────────────────────────────────────
     if generate:
-        if seed_lock:
-            random.seed(int(seed_val))
+        if st.session_state.get("use_seed"):
+            random.seed(int(st.session_state.get("seed_val", 42)))
         else:
             random.seed()
+        faction_name = random.choice(list(FACTIONS.keys())) if faction_sel == "★ Surprise Me" else faction_sel
+        card_type    = random.choice(CARD_TYPES)             if type_sel   == "★ Surprise Me" else type_sel
+        card = generate_card(faction_name, card_type, concept.strip())
+        if name_override.strip():
+            card["name"] = name_override.strip()
+        _load_card_to_state(card)
+        st.rerun()
 
-        faction_name = random.choice(faction_list) if faction_sel == "★ Surprise Me" else faction_sel
-        card_type    = random.choice(CARD_TYPES)   if type_sel   == "★ Surprise Me" else type_sel
+    if not st.session_state.get("card_generated"):
+        st.info("Choose options above and click ⚡ FORGE CARD to generate your first card.")
+        return
 
-        card    = generate_card(faction_name, card_type, concept.strip())
-        prompts = build_art_prompts(card)
-        st.session_state["last_card"]    = card
-        st.session_state["last_prompts"] = prompts
+    st.divider()
+    faction   = st.session_state.get("ws_faction",   "Celestial Host")
+    card_type = st.session_state.get("ws_card_type", "Servant")
 
-    if "last_card" in st.session_state:
-        card    = st.session_state["last_card"]
-        prompts = st.session_state["last_prompts"]
-        ascii_card = render_card_ascii(card)
+    # ── Two-column workshop ───────────────────────────────────────────────────
+    col_preview, col_editor = st.columns([1, 1], gap="large")
 
-        with col_card:
-            st.markdown(f'<div class="card-box">{ascii_card}</div>', unsafe_allow_html=True)
-            st.caption(f"**{card['rarity']}** · {card['faction']} · {card['card_type']}")
+    # ── LEFT: Live card preview ───────────────────────────────────────────────
+    with col_preview:
+        card = _card_from_state()
+        st.markdown(f'<div class="card-box">{render_card_ascii(card)}</div>', unsafe_allow_html=True)
+        st.caption(f"**{card['rarity']}** · {card['faction']} · {card['card_type']}")
+        prompts   = build_art_prompts(card)
+        save_text = build_save_text(card, prompts)
+        filename  = f"{card['name'].replace(' ', '_')}_{card['rarity']}.txt"
+        st.download_button("💾 Download Card + Art Prompts (.txt)",
+                           data=save_text, file_name=filename,
+                           mime="text/plain", use_container_width=True)
 
-            save_text = build_save_text(card, prompts)
-            filename  = f"{card['name'].replace(' ', '_')}_{card['rarity']}.txt"
-            st.download_button(
-                label="💾 Download Card + Art Prompts (.txt)",
-                data=save_text,
-                file_name=filename,
-                mime="text/plain",
-                use_container_width=True,
-            )
+    # ── RIGHT: Field editor ───────────────────────────────────────────────────
+    with col_editor:
+        st.subheader("Edit Fields")
+        st.caption("Type directly or click 🔄 to regenerate any piece individually.")
 
-        # Art prompts section
-        st.divider()
-        st.subheader("🎨 Art Prompts")
-        p1, p2, p3 = st.columns(3)
-        with p1:
-            st.markdown("**Midjourney**")
-            st.text_area("", value=prompts["midjourney"], height=120, key="mj", label_visibility="collapsed")
-        with p2:
-            st.markdown("**DALL·E 3**")
-            st.text_area("", value=prompts["dalle"], height=120, key="dalle", label_visibility="collapsed")
-        with p3:
-            st.markdown("**Stable Diffusion**")
-            st.text_area("", value=f"[+] {prompts['sd_pos']}\n\n[-] {prompts['sd_neg']}", height=120, key="sd", label_visibility="collapsed")
+        # — Name —
+        nc, nb = st.columns([5, 1])
+        with nc: st.text_input("Card Name", key="edit_name")
+        with nb:
+            if _regen_btn("🔄", "rn", "Regenerate name"):
+                fd = FACTIONS[faction]
+                if card_type == "Servant":
+                    new_name, _ = build_servant_name(fd, st.session_state.get("edit_rarity", "Common"), concept)
+                else:
+                    new_name = build_card_name(fd, card_type, st.session_state.get("sel_concept", ""))
+                st.session_state["edit_name"] = new_name
+                st.rerun()
+
+        # — Faith Cost + Rarity —
+        costc, costr, rarc, rarb = st.columns([3, 1, 3, 1])
+        with costc: st.text_input("Faith Cost", key="edit_cost", help="e.g. {2}{✦}{✦}")
+        with costr:
+            if _regen_btn("🔄", "rc", "Regenerate cost"):
+                new_cost, _ = build_faith_cost(FACTIONS[faction], RARITIES[st.session_state.get("edit_rarity", "Common")])
+                st.session_state["edit_cost"] = new_cost
+                st.rerun()
+        with rarc: st.selectbox("Rarity", list(RARITIES.keys()), key="edit_rarity")
+        with rarb:
+            if _regen_btn("🔄", "rrar", "Randomize rarity"):
+                st.session_state["edit_rarity"] = pick_rarity()
+                st.rerun()
+
+        # — Type Line —
+        st.text_input("Type Line", key="edit_type_line",
+                      help="e.g. Servant — Angel / Archangel [Celestial Host]")
+
+        st.markdown("---")
+        st.markdown("**Abilities**")
+
+        # — Keyword (slot 0) —
+        ab0c, ab0b = st.columns([5, 1])
+        with ab0c: st.text_input("① Keyword", key="edit_ab0")
+        with ab0b:
+            if _regen_btn("🔄", "rab0", "Regenerate keyword"):
+                st.session_state["edit_ab0"] = random.choice(FACTIONS[faction]["keywords"])
+                st.rerun()
+
+        # — Ability 2 (slot 1) —
+        ab1c, ab1b = st.columns([5, 1])
+        with ab1c: st.text_area("② Effect", key="edit_ab1", height=90)
+        with ab1b:
+            if _regen_btn("🔄", "rab1", "Regenerate effect"):
+                st.session_state["edit_ab1"] = _regen_effect(
+                    faction, card_type, st.session_state.get("edit_name", "~"))
+                st.rerun()
+
+        # — Ability 3 (slot 2) —
+        ab2c, ab2b = st.columns([5, 1])
+        with ab2c: st.text_area("③ Extra Effect (Legendary / optional)", key="edit_ab2", height=90)
+        with ab2b:
+            if _regen_btn("🔄", "rab2", "Regenerate extra effect"):
+                st.session_state["edit_ab2"] = _regen_effect(
+                    faction, card_type, st.session_state.get("edit_name", "~"))
+                st.rerun()
+
+        st.markdown("---")
+
+        # — Flavor Text —
+        flc, flb = st.columns([5, 1])
+        with flc: st.text_area("Flavor Text", key="edit_flavor", height=90)
+        with flb:
+            if _regen_btn("🔄", "rfl", "Regenerate flavor text"):
+                st.session_state["edit_flavor"] = random.choice(FACTIONS[faction]["flavor_quotes"])
+                st.rerun()
+
+        # — ATK / DEF (Servant only) —
+        if card_type == "Servant":
+            st.markdown("---")
+            atkc, defc, stb = st.columns([2, 2, 1])
+            with atkc: st.number_input("ATK", min_value=0, max_value=9999, step=100, key="edit_atk")
+            with defc: st.number_input("DEF", min_value=0, max_value=9999, step=100, key="edit_def")
+            with stb:
+                if _regen_btn("🔄", "rst", "Regenerate ATK/DEF"):
+                    atk, def_ = build_atk_def(
+                        RARITIES[st.session_state.get("edit_rarity", "Common")],
+                        count_cost(st.session_state.get("edit_cost", "{2}")))
+                    st.session_state["edit_atk"] = atk
+                    st.session_state["edit_def"] = def_
+                    st.rerun()
+
+    # ── Art Prompts (full width below) ────────────────────────────────────────
+    st.divider()
+    st.subheader("🎨 Art Prompts")
+    artc, artb = st.columns([5, 1])
+    with artc:
+        st.text_input("Art Description (drives all 3 prompts)", key="edit_art_desc")
+    with artb:
+        if _regen_btn("🔄 Regen", "rart", "Regenerate art description from concept"):
+            concept_cur = st.session_state.get("sel_concept", "")
+            new_art = (concept_cur + ", " if concept_cur else "") + FACTIONS[faction]["art_style"]
+            st.session_state["edit_art_desc"] = new_art
+            st.rerun()
+
+    card = _card_from_state()
+    prompts = build_art_prompts(card)
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        st.markdown("**Midjourney**")
+        st.text_area("mj", value=prompts["midjourney"], height=130, key="disp_mj", label_visibility="collapsed")
+    with p2:
+        st.markdown("**DALL·E 3**")
+        st.text_area("dalle", value=prompts["dalle"], height=130, key="disp_dalle", label_visibility="collapsed")
+    with p3:
+        st.markdown("**Stable Diffusion**")
+        st.text_area("sd", value=f"[+] {prompts['sd_pos']}\n\n[-] {prompts['sd_neg']}", height=130, key="disp_sd", label_visibility="collapsed")
 
 
 def page_game_concepts():
